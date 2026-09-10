@@ -114,6 +114,42 @@ function Initialize-VsDevEnvironment {
         Remove-Item $tmpBat -Force -ErrorAction SilentlyContinue
     }
 
+    # Diagnose Windows SDK state regardless of whether vcvarsall found it
+    $kitsRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
+    Write-Host "Windows Kits root: $kitsRoot (exists: $(Test-Path $kitsRoot))"
+    if (Test-Path "$kitsRoot\Include") {
+        Get-ChildItem "$kitsRoot\Include" -Directory |
+            Sort-Object Name -Descending |
+            ForEach-Object {
+                $hasHeaders = Test-Path "$kitsRoot\Include\$($_.Name)\um\windows.h"
+                Write-Host "  SDK $($_.Name): windows.h=$hasHeaders"
+            }
+    } else {
+        Write-Host "  $kitsRoot\Include not found"
+    }
+
+    # If vcvarsall.bat left WindowsSDKDir empty (VS 2025 discovery issue), find the
+    # best installed SDK under Windows Kits and set the env vars that MSBuild reads.
+    if ([string]::IsNullOrEmpty($env:WindowsSDKDir)) {
+        Write-Host "WARNING: WindowsSDKDir empty after vcvarsall.bat — applying local SDK fallback"
+        # Accept any SDK version dir that has headers (um/ or ucrt/) — windows.h presence is reported
+        # diagnostically but not required here since the CI-installed component has all other headers.
+        $bestSdk = Get-ChildItem "$kitsRoot\Include" -Directory -ErrorAction SilentlyContinue |
+            Where-Object { (Test-Path "$kitsRoot\Include\$($_.Name)\um") -or (Test-Path "$kitsRoot\Include\$($_.Name)\ucrt") } |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+        if ($bestSdk) {
+            $sdkVer = $bestSdk.Name
+            $hasWindowsH = Test-Path "$kitsRoot\Include\$sdkVer\um\windows.h"
+            Write-Host "  Fallback: WindowsSDKDir=$kitsRoot\ Version=$sdkVer (windows.h present: $hasWindowsH)"
+            [System.Environment]::SetEnvironmentVariable('WindowsSDKDir',     "$kitsRoot\", 'Process')
+            [System.Environment]::SetEnvironmentVariable('WindowsSDKVersion', "$sdkVer\",   'Process')
+        } else {
+            Write-Error "SDK fallback failed: no SDK version dir with headers found under $kitsRoot\Include"
+            exit 1
+        }
+    }
+
     $global:VSDEVENV_ARCH = $Arch
 }
 
