@@ -60,6 +60,7 @@ Write-Host "MSBUILD=${global:MSBUILD}"
 Write-Host "VSINSTALLDIR=${global:VSINSTALLDIR}"
 Write-Host "VCVARSALL=${global:VCVARSALL}"
 
+
 # Determine version
 if ([string]::IsNullOrEmpty($Version)) {
     Write-Host "No target version specified, will determine it from POM"
@@ -78,103 +79,6 @@ if ([string]::IsNullOrEmpty($Version)) {
 }
 
 Write-Host "Target version is $Version"
-
-# Fallback SDK path set by Ensure-WindowsSDK when the system SDK is absent.
-# The RSP section in Invoke-MSBuild reads these if vcvarsall did not populate
-# WindowsSDKDir (because the registry key was missing or unwritable).
-$global:WINSDK_FALLBACK_DIR = $null
-$global:WINSDK_FALLBACK_VER = $null
-
-# Ensure the Windows SDK headers and import libs are accessible for MSBuild.
-# On VS 2025 Build Tools the vsconfig may install only the UCRT redistribution
-# component (Windows10SDK.22621) instead of the full SDK (Windows11SDK.22621),
-# leaving no headers or import libs.  When that is the case this function
-# installs the Microsoft.Windows.SDK.CPP NuGet packages and creates a standard
-# SDK directory layout under C:\winsdk\layout\ using directory junctions so
-# that MSBuild can resolve all include and library paths.  No writes to
-# system-owned directories are required; the layout path is stored in
-# $global:WINSDK_FALLBACK_DIR so Invoke-MSBuild can pass it via RSP.
-function Ensure-WindowsSDK {
-    $sdkVer  = '10.0.22621.0'
-    $pkgVer  = '10.0.22621.3233'
-    $marker  = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\$sdkVer\um\windows.h"
-
-    if (Test-Path $marker) {
-        Write-Host "Windows SDK $sdkVer already present at system path"
-        return
-    }
-
-    $nugetDir  = 'C:\winsdk'
-    $layoutDir = "$nugetDir\layout"
-    $layoutMarker = "$layoutDir\Include\$sdkVer\um\windows.h"
-
-    if (Test-Path $layoutMarker) {
-        Write-Host "Windows SDK $sdkVer already present at $layoutDir"
-        $global:WINSDK_FALLBACK_DIR = "$layoutDir\"
-        $global:WINSDK_FALLBACK_VER = $sdkVer
-        return
-    }
-
-    Write-Host "Windows SDK headers missing - installing via NuGet packages..."
-
-    # Locate or download nuget.exe
-    $nugetCmd = Get-Command nuget.exe -ErrorAction SilentlyContinue
-    $nuget = if ($nugetCmd) { $nugetCmd.Source } else { $null }
-    if (-not $nuget) {
-        $nuget = "$env:TEMP\nuget.exe"
-        if (-not (Test-Path $nuget)) {
-            Write-Host "Downloading nuget.exe..."
-            Invoke-WebRequest -Uri 'https://dist.nuget.org/win-x86-commandline/latest/nuget.exe' `
-                              -OutFile $nuget -UseBasicParsing
-        }
-    }
-
-    New-Item -ItemType Directory -Path $nugetDir -Force | Out-Null
-
-    foreach ($pkg in @('Microsoft.Windows.SDK.CPP',
-                        'Microsoft.Windows.SDK.CPP.x86',
-                        'Microsoft.Windows.SDK.CPP.x64')) {
-        if (-not (Test-Path "$nugetDir\$pkg.$pkgVer")) {
-            Write-Host "Installing $pkg $pkgVer..."
-            & $nuget install $pkg -Version $pkgVer -OutputDirectory $nugetDir -NonInteractive
-            if ($LASTEXITCODE -ne 0) {
-                Write-Error "NuGet install failed for $pkg"
-                exit $LASTEXITCODE
-            }
-        }
-    }
-
-    $mainPkg = "$nugetDir\Microsoft.Windows.SDK.CPP.$pkgVer\c"
-    $x86Pkg  = "$nugetDir\Microsoft.Windows.SDK.CPP.x86.$pkgVer\c"
-    $x64Pkg  = "$nugetDir\Microsoft.Windows.SDK.CPP.x64.$pkgVer\c"
-
-    # Build a standard SDK directory tree under layoutDir using junctions.
-    # All targets are within C:\winsdk\ which the build agent can write to.
-    New-Item -ItemType Directory -Path "$layoutDir\Include"           -Force | Out-Null
-    New-Item -ItemType Directory -Path "$layoutDir\Lib\$sdkVer\um"   -Force | Out-Null
-    New-Item -ItemType Directory -Path "$layoutDir\Lib\$sdkVer\ucrt" -Force | Out-Null
-
-    $junctions = @(
-        @{ Link = "$layoutDir\Include\$sdkVer";       Target = "$mainPkg\Include\$sdkVer" },
-        @{ Link = "$layoutDir\DesignTime";             Target = "$mainPkg\DesignTime"       },
-        @{ Link = "$layoutDir\bin";                    Target = "$mainPkg\bin"              },
-        @{ Link = "$layoutDir\Lib\$sdkVer\um\x86";   Target = "$x86Pkg\um\x86"   },
-        @{ Link = "$layoutDir\Lib\$sdkVer\um\x64";   Target = "$x64Pkg\um\x64"   },
-        @{ Link = "$layoutDir\Lib\$sdkVer\ucrt\x86"; Target = "$x86Pkg\ucrt\x86" },
-        @{ Link = "$layoutDir\Lib\$sdkVer\ucrt\x64"; Target = "$x64Pkg\ucrt\x64" }
-    )
-
-    foreach ($j in $junctions) {
-        if (-not (Test-Path $j.Link)) {
-            New-Item -ItemType Junction -Path $j.Link -Target $j.Target | Out-Null
-            Write-Host "Junction: $($j.Link) -> $($j.Target)"
-        }
-    }
-
-    $global:WINSDK_FALLBACK_DIR = "$layoutDir\"
-    $global:WINSDK_FALLBACK_VER = $sdkVer
-    Write-Host "Windows SDK $sdkVer layout created at $layoutDir"
-}
 
 # Set up the VC build environment for the given target architecture by running
 # vcvarsall.bat in a cmd subprocess, capturing the resulting environment via
@@ -251,57 +155,6 @@ function Invoke-MSBuild {
             "/p:Platform=$Platform"
         )
 
-        # Pass the SDK location and version to MSBuild explicitly so it can
-        # construct the correct include/lib paths without registry lookups.
-        # vcvarsall.bat sets WindowsSDKDir when it finds the SDK via registry;
-        # on agents where that key is absent we fall back to the layout created
-        # by Ensure-WindowsSDK.  Either way we write the values to an MSBuild
-        # response file to avoid trailing-backslash quoting issues: inside a
-        # double-quoted /p: argument a path ending in \ makes \" escape the
-        # closing quote and corrupts all subsequent arguments.  RSP files use
-        # CommandLineToArgvW quoting so we double the trailing backslash ("\\")
-        # so the parser sees one literal backslash and the quote closes normally.
-        # Determine the SDK dir and version to pass via RSP.
-        # Prefer the values vcvarsall.bat populated, but only if the headers are
-        # actually present there; on agents missing the full SDK component,
-        # WindowsSDKVersion may be set to a bare backslash or a path with no
-        # headers, in which case we fall back to the NuGet layout built by
-        # Ensure-WindowsSDK.
-        $rspSdkDir = $env:WindowsSDKDir
-        $rspSdkVer = if ($env:WindowsSDKVersion) { $env:WindowsSDKVersion.TrimEnd('\') } else { $null }
-        $headersPresent = $rspSdkDir -and $rspSdkVer -and `
-            (Test-Path (Join-Path $rspSdkDir.TrimEnd('\') "Include\$rspSdkVer\um\windows.h"))
-        if (-not $headersPresent) {
-            $rspSdkDir = $global:WINSDK_FALLBACK_DIR
-            $rspSdkVer = $global:WINSDK_FALLBACK_VER
-        }
-
-        if ($rspSdkDir -and $rspSdkVer) {
-            $sdkDirNoSlash = $rspSdkDir.TrimEnd('\')
-            $sdkInc = "$sdkDirNoSlash\Include\$rspSdkVer"
-            $sdkLib = "$sdkDirNoSlash\Lib\$rspSdkVer"
-            # Set standard SDK properties so the toolset and linker use the
-            # right root.  Also inject WinPFallbackSDKInclude / WinPFallbackSDKLib
-            # as custom properties: the vcxproj files reference these in
-            # <AdditionalIncludeDirectories> and <AdditionalLibraryDirectories>
-            # which map directly to /I and /LIBPATH: flags.  This bypasses the
-            # v145 toolset's $(WindowsSDK_IncludePath) computation (which reads
-            # the Windows Kit registry key and cannot be overridden via /p: when
-            # the toolset props set it unconditionally).
-            $rspLines = "/p:WindowsSdkDir=`"$sdkDirNoSlash\\`"`n" +
-                        "/p:WindowsTargetPlatformVersion=$rspSdkVer`n" +
-                        "/p:UniversalCRTSdkDir=`"$sdkDirNoSlash\\`"`n" +
-                        "/p:UCRTContentRoot=`"$sdkDirNoSlash\\`"`n" +
-                        "/p:UCRTVersion=$rspSdkVer`n" +
-                        "/p:WindowsSDK_IncludePath=`"$sdkInc\um;$sdkInc\shared;$sdkInc\ucrt;$sdkInc\winrt;$sdkInc\cppwinrt`"`n" +
-                        "/p:WinPFallbackSDKInclude=`"$sdkInc\um;$sdkInc\shared;$sdkInc\ucrt`"`n" +
-                        "/p:WinPFallbackSDKLib=`"$sdkLib\um\$Arch;$sdkLib\ucrt\$Arch`""
-            Write-Host "SDK RSP: $($rspLines -replace "`n", ' | ')"
-            $rspFile = [System.IO.Path]::ChangeExtension([System.IO.Path]::GetTempFileName(), '.rsp')
-            [System.IO.File]::WriteAllText($rspFile, $rspLines)
-            $msbuildArgs += "@$rspFile"
-        }
-
         if ($Target) { $msbuildArgs += "/t:$Target" }
 
         Write-Host "Running MSBuild: $(Split-Path $absPath -Leaf) platform=$Platform target=$Target"
@@ -360,9 +213,6 @@ function Invoke-Build {
         Write-Host "Copied $($file.Source) to $($file.Dest)"
     }
 }
-
-# Ensure the Windows SDK is available before any MSBuild invocation
-Ensure-WindowsSDK
 
 # Main dispatch
 switch ($Command) {
