@@ -86,7 +86,7 @@ Write-Host "Target version is $Version"
 
 # Ensure the Windows SDK 10.0.22621.0 headers and libs are available for MSBuild.
 # VS 2025 Build Tools ship with a Windows10SDK.22621 component that omits the
-# Include/ directory entirely — the correct VS 2025 component is Windows11SDK.22621
+# Include/ directory entirely - the correct VS 2025 component is Windows11SDK.22621
 # (tracked in packer-images).  Until that lands, we download the SDK via NuGet and
 # build a junction-based layout at C:\winsdk\layout\ that MSBuild can use directly.
 function Ensure-WindowsSdk {
@@ -112,7 +112,7 @@ function Ensure-WindowsSdk {
         return
     }
 
-    Write-Host "Windows SDK $sdkVer headers not found — downloading via NuGet..."
+    Write-Host "Windows SDK $sdkVer headers not found - downloading via NuGet..."
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
     New-Item -ItemType Directory -Path $nugetDir -Force | Out-Null
@@ -216,7 +216,7 @@ function Initialize-VsDevEnvironment {
     # no headers), apply the fallback SDK path prepared by Ensure-WindowsSdk.
     if ([string]::IsNullOrEmpty($env:WindowsSDKDir)) {
         if (-not $global:WINSDK_FALLBACK_DIR) {
-            Write-Error "WindowsSDKDir empty and no SDK fallback available — Ensure-WindowsSdk must run first"
+            Write-Error "WindowsSDKDir empty and no SDK fallback available - Ensure-WindowsSdk must run first"
             exit 1
         }
         Write-Host "  Applying SDK fallback: $global:WINSDK_FALLBACK_DIR v$global:WINSDK_FALLBACK_VER"
