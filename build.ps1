@@ -221,7 +221,7 @@ function Initialize-VsDevEnvironment {
         }
         Write-Host "  Applying SDK fallback: $global:WINSDK_FALLBACK_DIR v$global:WINSDK_FALLBACK_VER"
         [System.Environment]::SetEnvironmentVariable('WindowsSDKDir',     $global:WINSDK_FALLBACK_DIR,        'Process')
-        [System.Environment]::SetEnvironmentVariable('WindowsSDKVersion', "$global:WINSDK_FALLBACK_VER\",     'Process')
+        [System.Environment]::SetEnvironmentVariable('WindowsSDKVersion', ($global:WINSDK_FALLBACK_VER + '\'), 'Process')
     }
 
     $global:VSDEVENV_ARCH = $Arch
