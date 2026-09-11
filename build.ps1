@@ -56,6 +56,10 @@ if (-not (Test-Path $global:VCVARSALL)) {
 # call vcvarsall.bat when the architecture actually changes.
 $global:VSDEVENV_ARCH = $null
 
+# Set by Ensure-WindowsSdk when the VS-installed SDK is missing.
+$global:WINSDK_FALLBACK_DIR = $null
+$global:WINSDK_FALLBACK_VER = $null
+
 Write-Host "MSBUILD=${global:MSBUILD}"
 Write-Host "VSINSTALLDIR=${global:VSINSTALLDIR}"
 Write-Host "VCVARSALL=${global:VCVARSALL}"
@@ -79,6 +83,86 @@ if ([string]::IsNullOrEmpty($Version)) {
 }
 
 Write-Host "Target version is $Version"
+
+# Ensure the Windows SDK 10.0.22621.0 headers and libs are available for MSBuild.
+# VS 2025 Build Tools ship with a Windows10SDK.22621 component that omits the
+# Include/ directory entirely — the correct VS 2025 component is Windows11SDK.22621
+# (tracked in packer-images).  Until that lands, we download the SDK via NuGet and
+# build a junction-based layout at C:\winsdk\layout\ that MSBuild can use directly.
+function Ensure-WindowsSdk {
+    $sdkVer    = '10.0.22621.0'
+    $kitsRoot  = "${env:ProgramFiles(x86)}\Windows Kits\10"
+    $layoutDir = 'C:\winsdk\layout'
+    $nugetDir  = 'C:\winsdk\nuget'
+
+    # Prefer the VS-installed SDK if Include/ is present with headers
+    $vsInclude = "$kitsRoot\Include\$sdkVer"
+    if ((Test-Path "$vsInclude\um") -or (Test-Path "$vsInclude\ucrt")) {
+        Write-Host "Windows SDK $sdkVer found in Windows Kits"
+        $global:WINSDK_FALLBACK_DIR = "$kitsRoot\"
+        $global:WINSDK_FALLBACK_VER = $sdkVer
+        return
+    }
+
+    # Reuse cached NuGet layout from a previous run on the same agent
+    if (Test-Path "$layoutDir\Include\$sdkVer\um\windows.h") {
+        Write-Host "Windows SDK NuGet layout found at $layoutDir"
+        $global:WINSDK_FALLBACK_DIR = "$layoutDir\"
+        $global:WINSDK_FALLBACK_VER = $sdkVer
+        return
+    }
+
+    Write-Host "Windows SDK $sdkVer headers not found — downloading via NuGet..."
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    New-Item -ItemType Directory -Path $nugetDir -Force | Out-Null
+    $nugetExe = "$nugetDir\nuget.exe"
+    if (-not (Test-Path $nugetExe)) {
+        Invoke-WebRequest -UseBasicParsing `
+            -Uri 'https://dist.nuget.org/win-x86-commandline/latest/nuget.exe' `
+            -OutFile $nugetExe
+    }
+
+    foreach ($pkg in @(
+        "Microsoft.Windows.SDK.CPP.$sdkVer",
+        "Microsoft.Windows.SDK.CPP.x86.$sdkVer",
+        "Microsoft.Windows.SDK.CPP.x64.$sdkVer"
+    )) {
+        Write-Host "  Installing $pkg"
+        & $nugetExe install $pkg -OutputDirectory $nugetDir -NonInteractive `
+            -Source 'https://api.nuget.org/v3/index.json' | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Error "NuGet install failed: $pkg"; exit 1 }
+    }
+
+    $basePkg = Get-ChildItem $nugetDir -Directory |
+        Where-Object { $_.Name -like "Microsoft.Windows.SDK.CPP.$sdkVer*" -and $_.Name -notmatch '\.x86\.|\.x64\.' } |
+        Select-Object -First 1
+    $x86Pkg  = Get-ChildItem $nugetDir -Directory |
+        Where-Object { $_.Name -like "Microsoft.Windows.SDK.CPP.x86.$sdkVer*" } | Select-Object -First 1
+    $x64Pkg  = Get-ChildItem $nugetDir -Directory |
+        Where-Object { $_.Name -like "Microsoft.Windows.SDK.CPP.x64.$sdkVer*" } | Select-Object -First 1
+
+    # Create layout with junctions so MSBuild sees a standard Windows Kits tree
+    foreach ($d in @("$layoutDir\Include", "$layoutDir\Lib\$sdkVer\ucrt", "$layoutDir\Lib\$sdkVer\um")) {
+        New-Item -ItemType Directory -Path $d -Force | Out-Null
+    }
+    $junctions = @(
+        @{ L = "$layoutDir\Include\$sdkVer";              T = "$($basePkg.FullName)\c\Include\$sdkVer" },
+        @{ L = "$layoutDir\Lib\$sdkVer\ucrt\x86"; T = "$($x86Pkg.FullName)\c\Lib\$sdkVer\ucrt\x86" },
+        @{ L = "$layoutDir\Lib\$sdkVer\ucrt\x64"; T = "$($x64Pkg.FullName)\c\Lib\$sdkVer\ucrt\x64" },
+        @{ L = "$layoutDir\Lib\$sdkVer\um\x86";   T = "$($x86Pkg.FullName)\c\Lib\$sdkVer\um\x86" },
+        @{ L = "$layoutDir\Lib\$sdkVer\um\x64";   T = "$($x64Pkg.FullName)\c\Lib\$sdkVer\um\x64" }
+    )
+    foreach ($j in $junctions) {
+        if (-not (Test-Path $j.L)) {
+            cmd /c "mklink /J `"$($j.L)`" `"$($j.T)`"" | Out-Null
+        }
+    }
+
+    Write-Host "Windows SDK layout ready at $layoutDir"
+    $global:WINSDK_FALLBACK_DIR = "$layoutDir\"
+    $global:WINSDK_FALLBACK_VER = $sdkVer
+}
 
 # Set up the VC build environment for the given target architecture by running
 # vcvarsall.bat in a cmd subprocess, capturing the resulting environment via
@@ -128,26 +212,16 @@ function Initialize-VsDevEnvironment {
         Write-Host "  $kitsRoot\Include not found"
     }
 
-    # If vcvarsall.bat left WindowsSDKDir empty (VS 2025 discovery issue), find the
-    # best installed SDK under Windows Kits and set the env vars that MSBuild reads.
+    # If vcvarsall.bat left WindowsSDKDir empty (VS 2025 Windows10SDK.22621 installs
+    # no headers), apply the fallback SDK path prepared by Ensure-WindowsSdk.
     if ([string]::IsNullOrEmpty($env:WindowsSDKDir)) {
-        Write-Host "WARNING: WindowsSDKDir empty after vcvarsall.bat — applying local SDK fallback"
-        # Accept any SDK version dir that has headers (um/ or ucrt/) — windows.h presence is reported
-        # diagnostically but not required here since the CI-installed component has all other headers.
-        $bestSdk = Get-ChildItem "$kitsRoot\Include" -Directory -ErrorAction SilentlyContinue |
-            Where-Object { (Test-Path "$kitsRoot\Include\$($_.Name)\um") -or (Test-Path "$kitsRoot\Include\$($_.Name)\ucrt") } |
-            Sort-Object Name -Descending |
-            Select-Object -First 1
-        if ($bestSdk) {
-            $sdkVer = $bestSdk.Name
-            $hasWindowsH = Test-Path "$kitsRoot\Include\$sdkVer\um\windows.h"
-            Write-Host "  Fallback: WindowsSDKDir=$kitsRoot\ Version=$sdkVer (windows.h present: $hasWindowsH)"
-            [System.Environment]::SetEnvironmentVariable('WindowsSDKDir',     "$kitsRoot\", 'Process')
-            [System.Environment]::SetEnvironmentVariable('WindowsSDKVersion', "$sdkVer\",   'Process')
-        } else {
-            Write-Error "SDK fallback failed: no SDK version dir with headers found under $kitsRoot\Include"
+        if (-not $global:WINSDK_FALLBACK_DIR) {
+            Write-Error "WindowsSDKDir empty and no SDK fallback available — Ensure-WindowsSdk must run first"
             exit 1
         }
+        Write-Host "  Applying SDK fallback: $global:WINSDK_FALLBACK_DIR v$global:WINSDK_FALLBACK_VER"
+        [System.Environment]::SetEnvironmentVariable('WindowsSDKDir',     $global:WINSDK_FALLBACK_DIR,        'Process')
+        [System.Environment]::SetEnvironmentVariable('WindowsSDKVersion', "$global:WINSDK_FALLBACK_VER\",     'Process')
     }
 
     $global:VSDEVENV_ARCH = $Arch
@@ -249,6 +323,9 @@ function Invoke-Build {
         Write-Host "Copied $($file.Source) to $($file.Dest)"
     }
 }
+
+# Ensure the Windows SDK is available before any build or clean operation.
+Ensure-WindowsSdk
 
 # Main dispatch
 switch ($Command) {
